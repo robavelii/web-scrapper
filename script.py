@@ -1,104 +1,156 @@
-import requests
+import asyncio
+import aiohttp
 from bs4 import BeautifulSoup
-import csv 
 from urllib.parse import urljoin, urlparse
+from urllib import robotparser
+import csv
 import time
 import random
+from fake_useragent import UserAgent
+import logging
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-def get_domain(url):
-    return urlparse(url).netloc
+class AdvancedScraper:
+    def __init__(self, start_url, max_pages=10, use_selenium=False):
+        self.start_url = start_url
+        self.max_pages = max_pages
+        self.domain = urlparse(start_url).netloc
+        self.scraped_urls = set()
+        self.to_scrape = [start_url]
+        self.user_agent = UserAgent()
+        self.use_selenium = use_selenium
+        self.session = None
+        self.driver = None
+        self.robots = None
 
-def extract_text(element):
-    return element.get_text(strip=True) if element else ""
+    async def init_session(self):
+        self.session = aiohttp.ClientSession(headers={'User-Agent': self.user_agent.random})
 
-def scrape_page(url):
-    try: 
-        response = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'})
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, 'html.parser')
+    def init_selenium(self):
+        options = Options()
+        options.add_argument("--headless")
+        options.add_argument(f"user-agent={self.user_agent.random}")
+        self.driver = webdriver.Chrome(options=options)
 
-        # Extract title
-        title = extract_text(soup.title) or extract_text(soup.find('h1'))
-        
-        # Extract description
-        description = extract_text(soup.find('meta', attrs={'name': 'description'}))
-        if not description:
-            description = extract_text(soup.find('p'))
+    async def fetch_robots_txt(self):
+        robots_url = f"https://{self.domain}/robots.txt"
+        self.robots = robotparser.RobotFileParser(robots_url)
+        async with self.session.get(robots_url) as response:
+            if response.status == 200:
+                content = await response.text()
+                self.robots.parse(content.splitlines())
+            else:
+                logger.warning(f"No robots.txt found at {robots_url}")
 
-        # Extract keywords
-        keywords = extract_text(soup.find('meta', attrs={'name': 'keywords'}))
+    async def is_allowed(self, url):
+        if self.robots:
+            return self.robots.can_fetch(self.user_agent.random, url)
+        return True
 
-        # Extract author
-        author = extract_text(soup.find('meta', attrs={'name': 'author'}))
+    async def fetch_page(self, url):
+        if not await self.is_allowed(url):
+            logger.info(f"Skipping {url} as per robots.txt")
+            return None
 
-          
-        # Extract links
-        links = [urljoin(url, a.get('href')) for a in soup.find_all('a', href=True)]
-        internal_links = [link for link in links if get_domain(link) == get_domain(url)]
-        external_links = [link for link in links if get_domain(link) != get_domain(url)]
+        if self.use_selenium:
+            return await self.fetch_with_selenium(url)
+        else:
+            return await self.fetch_with_requests(url)
 
+    async def fetch_with_requests(self, url):
+        try:
+            async with self.session.get(url) as response:
+                if response.status == 200:
+                    return await response.text()
+                else:
+                    logger.warning(f"Failed to fetch {url}: HTTP {response.status}")
+        except Exception as e:
+            logger.error(f"Error fetching {url}: {str(e)}")
+        return None
+
+    async def fetch_with_selenium(self, url):
+        try:
+            self.driver.get(url)
+            WebDriverWait(self.driver, 10).until(
+                EC.presence_of_element_located((By.TAG_NAME, "body"))
+            )
+            return self.driver.page_source
+        except Exception as e:
+            logger.error(f"Error fetching {url} with Selenium: {str(e)}")
+        return None
+
+    def parse_page(self, html, url):
+        soup = BeautifulSoup(html, 'html.parser')
+        title = soup.title.string if soup.title else ''
+        description = soup.find('meta', attrs={'name': 'description'})
+        description = description['content'] if description else ''
+        links = [urljoin(url, a['href']) for a in soup.find_all('a', href=True)]
         return {
             'url': url,
             'title': title,
             'description': description,
-            'keywords': keywords,
-            'author': author,
-            'internal_links': internal_links,
-            'external_links': external_links
+            'links': links
         }
 
-    except requests.RequestException as e:
-        print(f"Error fetching {url}: {e}")
-        return None
-    
-def scrape_website(start_url, max_pages=10):
-    domain = get_domain(start_url)
-    scraped_data = []
-    to_scrape = [start_url]
-    scraped_urls = set()
+    async def scrape_website(self):
+        await self.init_session()
+        if self.use_selenium:
+            self.init_selenium()
+        await self.fetch_robots_txt()
 
-    while to_scrape and len(scraped_data) < max_pages:
-        url = to_scrape.pop(0)
-        if url in scraped_urls:
-            continue
+        scraped_data = []
+        while self.to_scrape and len(scraped_data) < self.max_pages:
+            url = self.to_scrape.pop(0)
+            if url in self.scraped_urls:
+                continue
 
-        print(f"Scraping {url}")
-        data = scrape_page(url)
+            logger.info(f"Scraping: {url}")
+            html = await self.fetch_page(url)
+            if html:
+                data = self.parse_page(html, url)
+                scraped_data.append(data)
+                self.scraped_urls.add(url)
 
-        if data:
-            scraped_data.append(data)
-            scraped_urls.add(url)
+                new_links = [link for link in data['links']
+                             if link not in self.scraped_urls and urlparse(link).netloc == self.domain]
+                self.to_scrape.extend(new_links)
 
-            # Add new internal links to scraped
-            new_links = [link for link in data['internal_links'] 
-                         if link not in scraped_urls and get_domain(link) == domain]
-            to_scrape.extend(new_links)
+            await asyncio.sleep(random.uniform(1, 3))
 
-        time.sleep(random.uniform(1, 3)) # Add delay between requests
+        await self.session.close()
+        if self.driver:
+            self.driver.quit()
 
-    return scraped_data
+        return scraped_data
 
-def save_to_csv(data, filename = 'scraped_data.csv'):
-    if not data: 
-        print("No data to save")
+def save_to_csv(data, filename='scraped_data.csv'):
+    if not data:
+        logger.warning("No data to save.")
         return
-    
+
     keys = data[0].keys()
-    with open(filename, 'w', newline='', encoding='utf-8') as output_file:
-        writer = csv.DictWriter(output_file, fieldnames=keys)
+    with open(filename, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=keys)
         writer.writeheader()
         for row in data:
-            writer.writerow({k: str(v) if isinstance(v,list) else v for k, v in row.items()})
+            writer.writerow(row)
 
-def main():
-    start_url = input("Enter the URL to start scrapping: ")
+async def main():
+    start_url = input("Enter the URL to start scraping: ")
     max_pages = int(input("Enter the maximum number of pages to scrape: "))
+    use_selenium = input("Use Selenium for JavaScript rendering? (y/n): ").lower() == 'y'
 
-    scraped_data = scrape_website(start_url, max_pages)
+    scraper = AdvancedScraper(start_url, max_pages, use_selenium)
+    scraped_data = await scraper.scrape_website()
     save_to_csv(scraped_data)
-    print(f"Scraped {len(scraped_data)} pages. Data saved to scraped_data.csv")
-    
+    logger.info(f"Scraped {len(scraped_data)} pages. Data saved to scraped_data.csv")
 
 if __name__ == '__main__':
-    main()
+    asyncio.run(main())
